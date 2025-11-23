@@ -1,0 +1,949 @@
+---
+title: "hmda_logistic"
+output: html_document
+date: "2025-11-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# read v3_94variables.csv from downloads
+data <- read.csv("~/Downloads/v3_94variables.csv")
+head(data)
+```
+```{r}
+# remove dots from all column names
+colnames(data) <- gsub("\\.", "", colnames(test_data))
+colnames(data)
+```
+```{r}
+# split data into training and testing sets
+set.seed(123)
+train_indices <- sample(1:nrow(data), 0.7 * nrow(data))
+train_data <- data[train_indices, ]
+test_data <- data[-train_indices, ]
+nrow(train_data)
+nrow(test_data)
+#drop action_taken from test_data
+test_data$action_taken <- NULL
+```
+
+
+
+
+```{r}
+# fit logistic regression model on train data for action_taken using all cols
+model <- glm(action_taken ~ ., data = data, family = binomial)
+summary(model)
+```
+```{r}
+# check accuracy on test data
+predictions <- predict(model, newdata = test_data, type = "response")
+head(predictions)
+```
+```{r}
+# convert probabilities to binary outcomes using 0.5 threshold
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+head(predicted_classes)
+```
+```{r}
+df <- read.csv("~/Downloads/v3_94variables.csv", stringsAsFactors = FALSE)
+
+# drop denial reason 1 and 2 columns from df
+df$denial_reason_1 <- NULL
+df$denial_reason_2 <- NULL
+
+
+# Treat action_taken as categorical response
+df$action_taken <- as.factor(df$action_taken)
+
+target_var <- "action_taken"
+
+
+## 2. Drop columns with no variation --------------------------------------
+
+nzv_mask <- sapply(df, function(x) length(na.omit(unique(x))) > 1)
+df <- df[, nzv_mask]
+
+predictors <- setdiff(names(df), target_var)
+
+
+## 3. Identify binary dummy predictors ------------------------------------
+
+is_binary <- function(x) {
+  ux <- na.omit(unique(x))
+  all(ux %in% c(0, 1)) && length(ux) >= 2
+}
+
+binary_vars <- predictors[sapply(df[, predictors, drop = FALSE], is_binary)]
+
+
+## 4. Drop very rare dummies (too few 1s can cause separation) ------------
+
+# e.g., drop if fewer than 5 ones
+rare_mask <- sapply(df[, binary_vars, drop = FALSE],
+                    function(x) sum(x == 1, na.rm = TRUE) < 5)
+
+rare_vars <- names(rare_mask)[rare_mask]
+
+# keep predictors excluding rare ones
+predictors <- setdiff(predictors, rare_vars)
+binary_vars <- setdiff(binary_vars, rare_vars)
+
+
+## 5. Detect and drop separation-causing dummies ---------------------------
+
+sep_vars <- c()
+
+for (v in binary_vars) {
+  tab <- table(df[[target_var]], df[[v]])
+  # want at least 2 levels in outcome and 2 in predictor
+  if (nrow(tab) >= 2 && ncol(tab) == 2) {
+    # check each predictor level (0 and 1)
+    for (j in 1:2) {
+      col_j <- tab[, j]
+      # if one outcome level never occurs at this predictor level → separation
+      if (min(col_j) == 0 && max(col_j) > 0) {
+        sep_vars <- c(sep_vars, v)
+        break
+      }
+    }
+  }
+}
+
+sep_vars <- unique(sep_vars)
+
+# final predictors without separation-causing dummies
+predictors_final <- setdiff(predictors, sep_vars)
+
+
+## 6. Fit logistic regression with cleaned predictors ----------------------
+
+# build formula: action_taken ~ x1 + x2 + ...
+formula_str   <- paste(target_var, "~", paste(predictors_final, collapse = " + "))
+logit_formula <- as.formula(formula_str)
+
+model <- glm(logit_formula, data = df, family = binomial)
+
+summary(model)
+
+
+## 7. Extract significant columns (p < 0.05) -------------------------------
+
+coef_tab <- summary(model)$coefficients
+p_vals   <- coef_tab[, "Pr(>|z|)"]
+
+sig_cols <- names(p_vals)[p_vals < 0.05]
+sig_cols <- setdiff(sig_cols, "(Intercept)")
+
+sig_cols   # <-- this is the final list of significant columns
+#remove dots from sig_cols
+sig_cols <- gsub("\\.", "", sig_cols)
+#export the list of significant columns to a csv file
+write.csv(sig_cols, "Desktop/significant_columns.csv", row.names = FALSE)
+```
+```{r}
+car::vif(model)
+```
+
+```{r}
+df$action_taken
+```
+
+
+```{r}
+# install glmnet if not already installed
+if (!require(glmnet)) {
+  install.packages("glmnet")
+}
+# use lasso regression to select important features
+library(glmnet)
+x <- model.matrix(logit_formula, data = df)[, -1]  # exclude intercept
+y <- df$action_taken
+lasso_model <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+plot(lasso_model)
+best_lambda <- lasso_model$lambda.min
+lasso_coef <- coef(lasso_model, s = best_lambda)
+lasso_coef
+significant_features <- rownames(lasso_coef)[lasso_coef[, 1] != 0]
+significant_features <- significant_features[significant_features != "(Intercept)"]
+significant_features
+```
+```{r}
+library(glmnet)
+library(caret)
+
+# -----------------------------
+# 1. Prepare the data
+# -----------------------------
+
+# Target variable must be factor for evaluation
+df$action_taken <- factor(df$action_taken)
+
+# Only keep target + significant features
+df_lasso <- df[, c("action_taken", significant_features)]
+
+# Remove any rows with missing values
+df_lasso <- na.omit(df_lasso)
+
+# -----------------------------
+# 2. Train/Test Split (80/20)
+# -----------------------------
+
+set.seed(123)
+train_idx <- createDataPartition(df_lasso$action_taken, p = 0.8, list = FALSE)
+
+train_data <- df_lasso[train_idx, ]
+test_data  <- df_lasso[-train_idx, ]
+
+# -----------------------------
+# 3. Make model matrices for LASSO
+# -----------------------------
+
+x_train <- model.matrix(action_taken ~ ., train_data)[, -1]
+y_train <- train_data$action_taken
+
+x_test <- model.matrix(action_taken ~ ., test_data)[, -1]
+y_test <- test_data$action_taken
+
+# -----------------------------
+# 4. Fit LASSO Logistic Regression
+# -----------------------------
+
+set.seed(123)
+lasso_fit <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1
+)
+
+# -----------------------------
+# 5. Predict on the test set
+# -----------------------------
+
+pred_prob <- predict(lasso_fit, newx = x_test, s = "lambda.min", type = "response")
+pred_prob <- as.vector(pred_prob)  # <-- ADD THIS LINE
+pred_class <- ifelse(pred_prob > 0.1, "1", "2")
+pred_class <- factor(pred_class, levels = levels(y_test))
+confusionMatrix(pred_class, y_test)
+
+
+```
+```{r}
+summary(pred_prob)
+quantile(pred_prob, probs = seq(0,1,0.1))
+```
+```{r}
+summary(pred_prob)
+quantile(pred_prob, probs = seq(0,1,0.1))
+table(cut(pred_prob, breaks = seq(0,1,0.1)))
+
+```
+
+```{r}
+library(glmnet)
+library(caret)
+library(pROC)
+
+# ============================================================
+# 1. PREPARE THE DATA
+# ============================================================
+
+# Target variable must be factor for classification
+df$action_taken <- factor(df$action_taken)
+
+# Only keep target + significant features
+df_lasso <- df[, c("action_taken", significant_features)]
+
+# Remove any rows with missing values
+df_lasso <- na.omit(df_lasso)
+
+cat("Dataset prepared:\n")
+cat("  Total observations:", nrow(df_lasso), "\n")
+cat("  Number of features:", length(significant_features), "\n")
+cat("  Class distribution:\n")
+print(table(df_lasso$action_taken))
+cat("\n")
+
+
+# ============================================================
+# 2. TRAIN/TEST SPLIT (80/20)
+# ============================================================
+
+set.seed(123)
+train_idx <- createDataPartition(df_lasso$action_taken, p = 0.8, list = FALSE)
+
+train_data <- df_lasso[train_idx, ]
+test_data  <- df_lasso[-train_idx, ]
+
+cat("Data split:\n")
+cat("  Training set:", nrow(train_data), "observations\n")
+cat("  Test set:    ", nrow(test_data), "observations\n\n")
+
+
+# ============================================================
+# 3. CREATE MODEL MATRICES FOR LASSO
+# ============================================================
+
+x_train <- model.matrix(action_taken ~ ., train_data)[, -1]
+y_train <- train_data$action_taken
+
+x_test <- model.matrix(action_taken ~ ., test_data)[, -1]
+y_test <- test_data$action_taken
+
+
+# ============================================================
+# 4. FIT LASSO LOGISTIC REGRESSION WITH CROSS-VALIDATION
+# ============================================================
+
+set.seed(123)
+cat("Fitting Lasso model with 10-fold cross-validation...\n")
+
+lasso_fit <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 1,
+  nfolds = 10,
+  type.measure = "class"  # Use classification error for CV
+)
+
+cat("Model fitted successfully!\n\n")
+
+# Plot cross-validation results
+plot(lasso_fit, main = "Lasso Cross-Validation Results")
+
+# Print lambda values
+cat("Optimal lambda values:\n")
+cat("  lambda.min:", lasso_fit$lambda.min, "(minimum CV error)\n")
+cat("  lambda.1se:", lasso_fit$lambda.1se, "(1 SE rule - simpler model)\n\n")
+
+
+# ============================================================
+# 5. MAKE PREDICTIONS ON TEST SET
+# ============================================================
+
+# Get predicted probabilities (FIXED: convert to vector)
+pred_prob <- predict(lasso_fit, newx = x_test, s = "lambda.min", type = "response")
+pred_prob <- as.vector(pred_prob)  # Convert matrix to vector
+
+# Summary of predicted probabilities
+cat("=== PREDICTED PROBABILITIES SUMMARY ===\n")
+print(summary(pred_prob))
+cat("\nQuantiles:\n")
+print(quantile(pred_prob, probs = seq(0, 1, 0.1)))
+cat("\n")
+
+# Make class predictions using 0.5 threshold
+pred_class <- ifelse(pred_prob > 0.5, levels(y_test)[2], levels(y_test)[1])
+pred_class <- factor(pred_class, levels = levels(y_test))
+
+
+# ============================================================
+# 6. EVALUATE MODEL PERFORMANCE
+# ============================================================
+
+cat("=== CONFUSION MATRIX (Threshold = 0.5) ===\n")
+cm <- confusionMatrix(pred_class, y_test, positive = levels(y_test)[2])
+print(cm)
+cat("\n")
+
+# Extract key metrics
+cat("=== KEY PERFORMANCE METRICS ===\n")
+cat("Accuracy:   ", round(cm$overall['Accuracy'], 4), "\n")
+cat("Kappa:      ", round(cm$overall['Kappa'], 4), "\n")
+cat("Sensitivity:", round(cm$byClass['Sensitivity'], 4), "\n")
+cat("Specificity:", round(cm$byClass['Specificity'], 4), "\n")
+cat("Precision:  ", round(cm$byClass['Pos Pred Value'], 4), "\n")
+cat("F1 Score:   ", round(cm$byClass['F1'], 4), "\n\n")
+
+
+# ============================================================
+# 7. ROC CURVE AND AUC
+# ============================================================
+
+roc_obj <- roc(y_test, pred_prob, levels = levels(y_test))
+
+cat("=== ROC ANALYSIS ===\n")
+cat("AUC (Area Under Curve):", round(auc(roc_obj), 4), "\n\n")
+
+# Plot ROC curve
+plot(roc_obj, main = "ROC Curve - Lasso Classification",
+     col = "blue", lwd = 2)
+legend("bottomright", 
+       legend = paste("AUC =", round(auc(roc_obj), 4)),
+       col = "blue", lwd = 2)
+
+
+# ============================================================
+# 8. FIND OPTIMAL THRESHOLD
+# ============================================================
+
+cat("=== TESTING DIFFERENT THRESHOLDS ===\n")
+
+threshold_results <- data.frame()
+
+thresholds <- seq(0.1, 0.9, 0.1)
+
+for(thresh in thresholds) {
+  pred_temp <- ifelse(pred_prob > thresh, levels(y_test)[2], levels(y_test)[1])
+  pred_temp <- factor(pred_temp, levels = levels(y_test))
+  
+  cm_temp <- confusionMatrix(pred_temp, y_test, positive = levels(y_test)[2])
+  
+  threshold_results <- rbind(threshold_results, data.frame(
+    threshold = thresh,
+    accuracy = cm_temp$overall['Accuracy'],
+    sensitivity = cm_temp$byClass['Sensitivity'],
+    specificity = cm_temp$byClass['Specificity'],
+    f1_score = cm_temp$byClass['F1']
+  ))
+}
+
+print(threshold_results)
+cat("\n")
+
+# Find best threshold by F1 score
+best_thresh <- threshold_results$threshold[which.max(threshold_results$f1_score)]
+cat("Best threshold by F1 Score:", best_thresh, "\n\n")
+
+
+# ============================================================
+# 9. PREDICTIONS WITH OPTIMAL THRESHOLD
+# ============================================================
+
+cat("=== CONFUSION MATRIX WITH OPTIMAL THRESHOLD ===\n")
+cat("Using threshold:", best_thresh, "\n\n")
+
+pred_class_optimal <- ifelse(pred_prob > best_thresh, levels(y_test)[2], levels(y_test)[1])
+pred_class_optimal <- factor(pred_class_optimal, levels = levels(y_test))
+
+cm_optimal <- confusionMatrix(pred_class_optimal, y_test, positive = levels(y_test)[2])
+print(cm_optimal)
+
+
+# ============================================================
+# 10. FEATURE IMPORTANCE (NON-ZERO COEFFICIENTS)
+# ============================================================
+
+cat("\n=== SELECTED FEATURES (NON-ZERO COEFFICIENTS) ===\n")
+
+# Get coefficients
+coef_lasso <- coef(lasso_fit, s = "lambda.min")
+coef_lasso <- as.matrix(coef_lasso)
+
+# Get non-zero coefficients (excluding intercept)
+nonzero_coef <- coef_lasso[coef_lasso[, 1] != 0, , drop = FALSE]
+nonzero_coef <- nonzero_coef[-1, , drop = FALSE]  # Remove intercept
+
+if(length(nonzero_coef) > 0) {
+  # Sort by absolute value
+  nonzero_coef <- nonzero_coef[order(abs(nonzero_coef), decreasing = TRUE), , drop = FALSE]
+  
+  cat("Number of selected features:", length(nonzero_coef), "\n\n")
+  cat("Top features by coefficient magnitude:\n")
+  print(head(nonzero_coef, 20))
+  
+  # Plot feature importance
+  if(length(nonzero_coef) <= 30) {
+    par(mar = c(5, 8, 4, 2))
+    barplot(sort(nonzero_coef[, 1]), 
+            horiz = TRUE, 
+            las = 1,
+            main = "Lasso Feature Importance",
+            xlab = "Coefficient Value",
+            col = ifelse(sort(nonzero_coef[, 1]) > 0, "steelblue", "coral"))
+    abline(v = 0, lty = 2, col = "gray")
+    par(mar = c(5, 4, 4, 2))
+  }
+} else {
+  cat("No features selected (all coefficients are zero)\n")
+}
+
+
+# ============================================================
+# 11. COMPARE lambda.min vs lambda.1se
+# ============================================================
+
+cat("\n=== COMPARING lambda.min vs lambda.1se ===\n\n")
+
+# Predictions with lambda.1se
+pred_prob_1se <- predict(lasso_fit, newx = x_test, s = "lambda.1se", type = "response")
+pred_prob_1se <- as.vector(pred_prob_1se)
+
+pred_class_1se <- ifelse(pred_prob_1se > 0.5, levels(y_test)[2], levels(y_test)[1])
+pred_class_1se <- factor(pred_class_1se, levels = levels(y_test))
+
+cm_1se <- confusionMatrix(pred_class_1se, y_test, positive = levels(y_test)[2])
+
+# Get number of features for each lambda
+n_features_min <- sum(coef(lasso_fit, s = "lambda.min") != 0) - 1
+n_features_1se <- sum(coef(lasso_fit, s = "lambda.1se") != 0) - 1
+
+comparison <- data.frame(
+  Lambda = c("lambda.min", "lambda.1se"),
+  Lambda_Value = c(lasso_fit$lambda.min, lasso_fit$lambda.1se),
+  Accuracy = c(cm$overall['Accuracy'], cm_1se$overall['Accuracy']),
+  F1_Score = c(cm$byClass['F1'], cm_1se$byClass['F1']),
+  N_Features = c(n_features_min, n_features_1se)
+)
+
+print(comparison)
+cat("\n")
+
+
+# ============================================================
+# 12. SAVE PREDICTIONS TO DATA FRAME
+# ============================================================
+
+predictions_df <- data.frame(
+  actual = y_test,
+  predicted_class = pred_class_optimal,
+  predicted_prob = pred_prob,
+  correct = y_test == pred_class_optimal
+)
+
+cat("=== SAMPLE PREDICTIONS ===\n")
+print(head(predictions_df, 10))
+
+# Export predictions (optional)
+# write.csv(predictions_df, "lasso_predictions.csv", row.names = FALSE)
+
+
+# ============================================================
+# 13. SUMMARY
+# ============================================================
+
+cat("\n")
+cat("========================================\n")
+cat("         FINAL MODEL SUMMARY            \n")
+cat("========================================\n")
+cat("Lambda used:      ", lasso_fit$lambda.min, "\n")
+cat("Features selected:", n_features_min, "\n")
+cat("Best threshold:   ", best_thresh, "\n")
+cat("Accuracy:         ", round(cm_optimal$overall['Accuracy'], 4), "\n")
+cat("AUC:              ", round(auc(roc_obj), 4), "\n")
+cat("F1 Score:         ", round(cm_optimal$byClass['F1'], 4), "\n")
+cat("========================================\n")
+```
+```{r}
+# ============================================================
+# CHECK OVERFITTING: TRAIN VS TEST PERFORMANCE
+# ============================================================
+
+# 1. Predictions on TRAIN data
+train_prob <- predict(lasso_fit, newx = x_train, s = "lambda.min", type = "response")
+train_prob <- as.vector(train_prob)
+train_pred <- ifelse(train_prob > 0.5, levels(y_train)[2], levels(y_train)[1])
+train_pred <- factor(train_pred, levels = levels(y_train))
+
+train_cm <- confusionMatrix(train_pred, y_train, positive = levels(y_train)[2])
+
+cat("=== TRAINING PERFORMANCE ===\n")
+print(train_cm)
+cat("Train AUC:", auc(roc(y_train, train_prob)), "\n\n")
+
+# 2. TEST performance already computed earlier (cm, roc_obj)
+cat("=== TEST PERFORMANCE ===\n")
+print(cm)
+cat("Test AUC:", auc(roc_obj), "\n\n")
+
+```
+
+
+
+```{r}
+levels(df$action_taken)
+```
+```{r}
+
+df_original <- read.csv("~/Downloads/v3_94variables.csv")
+# Method 1: Check the original levels of action_taken
+levels(df$action_taken)
+
+# Method 2: Check the original values before factorization
+# (if you still have the original data)
+unique(df_original$action_taken)  # Replace df_original with your original dataset name
+
+# Method 3: Check value counts with labels
+table(df$action_taken)
+
+# Method 4: If action_taken was numeric originally, check the mapping
+str(df$action_taken)
+
+# Method 5: Cross-reference with test data
+head(data.frame(
+  factor_level = y_test,
+  original_value = as.numeric(y_test)
+), 20)
+
+# Method 6: Check the dataset documentation or data dictionary
+# Look for variable descriptions in your data source
+```
+
+
+
+```{r}
+# If you have the original data file
+# Look at the first few rows with actual labels
+head(df[, c("action_taken", "loan_amount")], 20)
+head(df_original[, c("action_taken", "loan_amount")], 20)
+
+# Or check if there's a label mapping in your data preparation code
+```
+```{r}
+# count of 1 and 0 in action_taken in df_original and 1 and 2 in df
+table(df_original$action_taken)
+table(df$action_taken)
+```
+
+
+
+
+
+
+```{r}
+###########################################################
+# 1. Load Libraries
+###########################################################
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+library(caret)
+
+###########################################################
+# 2. Prepare Data: keep only target + LASSO-selected columns
+###########################################################
+
+# significant_features should be your list of 69 columns
+# Example:
+# significant_features <- c("region_West", "conforming_loan_limit_NC", ...)
+
+# change action taken = 3 to action taken = 0 (denied)
+df$action_taken <- ifelse(df$action_taken == 3, 0, df$action_taken)
+df$action_taken <- as.factor(df$action_taken)
+
+df_tree <- df %>% 
+  select(action_taken, all_of(significant_features))
+
+# Ensure categorical variables are treated as factors
+df_tree <- df_tree %>%
+  mutate(across(where(is.character), factor)) %>%
+  mutate(across(where(is.numeric), ~ .)) # numeric stays numeric
+
+
+###########################################################
+# 3. Train Decision Tree
+###########################################################
+
+set.seed(123)
+
+tree_model <- rpart(
+  action_taken ~ ., 
+  data = df_tree,
+  method = "class",
+  control = rpart.control(
+    cp = 0.001,        # allow tree to grow deep
+    minsplit = 30,     # avoid overfitting
+    maxdepth = 10
+  )
+)
+
+###########################################################
+# 4. Examine Complexity Parameter (cp) and Prune Tree
+###########################################################
+
+printcp(tree_model)        # cross-validated error
+plotcp(tree_model)         # cp curve
+
+# Choose cp with lowest xerror
+best_cp <- tree_model$cptable[which.min(tree_model$cptable[,"xerror"]), "CP"]
+
+# Prune the model
+pruned_tree <- prune(tree_model, cp = best_cp)
+
+
+###########################################################
+# 5. Plot Final Pruned Tree
+###########################################################
+
+rpart.plot(pruned_tree,
+           type = 2,           # splits show variable name
+           extra = 106,        # show prob + % observations
+           tweak = 1.2,
+           fallen.leaves = TRUE)
+
+
+###########################################################
+# 6. Variable Importance
+###########################################################
+
+importance <- pruned_tree$variable.importance
+print("Variable Importance:")
+print(importance)
+
+barplot(importance,
+        main="Decision Tree Variable Importance",
+        las=2, cex.names=.7)
+
+
+###########################################################
+# 7. Predictions + Accuracy (optional)
+###########################################################
+
+pred <- predict(pruned_tree, df_tree, type="class")
+
+confusionMatrix(as.factor(pred), as.factor(df_tree$denied))
+
+```
+```{r}
+library(randomForest)
+rf <- randomForest(action_taken ~ ., data = df_tree, importance = TRUE)
+varImpPlot(rf)
+
+```
+```{r}
+# read v4_decision_tree.csv from downloads
+dat <- read.csv("~/Downloads/v4_decision_tree.csv")
+head(dat)
+```
+```{r}
+# categorical columns in data_v1: state_code, county_code, conforming_loan_limit, derived_loan_product_type, derived_dwelling_category, action_taken, purchaser_type, preapproval, loan_type, loan_purpose, lien_status, reverse_mortgage, open_end_line_of_credit, business_or_commercial_purpose, hoepa_status, negative_amortization, interest_only_payment, balloon_payment, construction_method, occupancy_type, manufactured_home_secured_property_type, manufactured_home_land_property_interest, total_units, debt_to_income_ratio, applicant_credit_score_type, applicant_age, applicant_age_above_62, submission_of_application, initially_payable_to_institution, aus_1, aus_2, denial_reason_1, denial_reason_2
+categorical_cols <- c("conforming_loan_limit", "derived_loan_product_type", "derived_dwelling_category", "action_taken", "purchaser_type", "preapproval", "loan_type", "loan_purpose", "lien_status", "open_end_line_of_credit", "business_or_commercial_purpose", "hoepa_status", "negative_amortization", "interest_only_payment", "balloon_payment", "construction_method", "occupancy_type", "manufactured_home_secured_property_type", "manufactured_home_land_property_interest", "total_units", "applicant_credit_score_type", "submission_of_application", "initially_payable_to_institution", "aus_1", "aus_2", "region")
+# convert categorical columns to factors
+dat[categorical_cols] <- lapply(dat[categorical_cols], as.factor)
+```
+```{r}
+#install party package if not already installed
+if (!require(party)) {
+  install.packages("party")
+}
+# create tree model on dat using ctree from party package
+library(party)
+ctree_model <- ctree(action_taken ~ ., data = dat, control = ctree_control(mincriterion = 0.9, minsplit = 10, minbucket = 5, maxdepth = 10))
+# plot ctree_model
+plot(ctree_model)
+```
+```{r}
+# prune the ctree_model using the same parameters as above
+pruned_ctree <- ctree(action_taken ~ ., data = dat, control = ctree_control(mincriterion = 0.9, minsplit = 10, minbucket = 5, maxdepth = 5))
+# plot pruned_ctree
+plot(pruned_ctree)
+```
+```{r}
+# skim data used for ctree
+library(skimr)
+skim(dat)
+```
+
+
+```{r}
+tune_ctree_simple <- function(data, formula, param_grid, split_ratio = 0.7) {
+  set.seed(123)
+  
+  # Split data
+  train_idx <- sample(1:nrow(data), size = floor(split_ratio * nrow(data)))
+  train_data <- data[train_idx, ]
+  test_data <- data[-train_idx, ]
+  
+  results <- data.frame()
+  
+  cat("Testing", nrow(param_grid), "parameter combinations...\n")
+  
+  for(i in 1:nrow(param_grid)) {
+    # Fit model
+    model <- ctree(
+      formula,
+      data = train_data,
+      control = ctree_control(
+        mincriterion = param_grid$mincriterion[i],
+        minsplit = param_grid$minsplit[i],
+        minbucket = param_grid$minbucket[i],
+        maxdepth = param_grid$maxdepth[i]
+      )
+    )
+    
+    # Predict and calculate metrics
+    pred <- predict(model, newdata = test_data)
+    accuracy <- mean(pred == test_data$action_taken)
+    
+    results <- rbind(results, data.frame(
+      param_grid[i, ],
+      accuracy = accuracy,
+      n_terminal_nodes = length(nodeids(model, terminal = TRUE))
+    ))
+  }
+  
+  results <- results[order(-results$accuracy), ]
+  return(results)
+}
+
+
+# ============================================================
+# USAGE EXAMPLE
+# ============================================================
+
+# Define parameter grid around your current values
+param_grid <- expand.grid(
+  mincriterion = c(0.90, 0.95, 0.99),
+  minsplit = c(100, 150, 200, 250, 300),
+  minbucket = c(50, 75, 100, 125),
+  maxdepth = c(3, 4, 5, 6)
+
+quick_results <- tune_ctree_simple(dat, action_taken ~ ., param_grid)
+print(head(quick_results, 5))
+```
+```{r}
+tune_ctree_cv <- function(data, formula, param_grid, n_folds = 5) {
+  set.seed(123)
+  
+  # Create folds
+  folds <- createFolds(data$action_taken, k = n_folds, list = TRUE)
+  
+  results <- data.frame()
+  
+  cat("Testing", nrow(param_grid), "parameter combinations...\n")
+  
+  for(i in 1:nrow(param_grid)) {
+    cat("Testing combination", i, "of", nrow(param_grid), "\n")
+    
+    fold_accuracy <- numeric(n_folds)
+    
+    # Cross-validation
+    for(j in 1:n_folds) {
+      train_data <- data[-folds[[j]], ]
+      test_data <- data[folds[[j]], ]
+      
+      # Fit model
+      model <- ctree(
+        formula,
+        data = train_data,
+        control = ctree_control(
+          mincriterion = param_grid$mincriterion[i],
+          minsplit = param_grid$minsplit[i],
+          minbucket = param_grid$minbucket[i],
+          maxdepth = param_grid$maxdepth[i]
+        )
+      )
+      
+      # Predict and calculate accuracy
+      pred <- predict(model, newdata = test_data)
+      fold_accuracy[j] <- mean(pred == test_data$action_taken)
+    }
+    
+    # Store results
+    results <- rbind(results, data.frame(
+      mincriterion = param_grid$mincriterion[i],
+      minsplit = param_grid$minsplit[i],
+      minbucket = param_grid$minbucket[i],
+      maxdepth = param_grid$maxdepth[i],
+      mean_accuracy = mean(fold_accuracy),
+      sd_accuracy = sd(fold_accuracy)
+    ))
+  }
+  
+  # Sort by accuracy
+  results <- results[order(-results$mean_accuracy), ]
+  return(results)
+}
+results_cv <- tune_ctree_cv(
+  data = dat,
+  formula = action_taken ~ .,
+  param_grid = param_grid,
+  n_folds = 5
+)
+
+print("Top 10 parameter combinations (CV):")
+print(head(results_cv, 10))
+```
+```{r}
+print_rules_simple <- function(model) {
+  cat("=== SIMPLE RULE EXTRACTION ===\n\n")
+  print(model)
+  cat("\n")
+}
+print_rules_simple(ctree_model)
+```
+```{r}
+extract_rules <- function(model) {
+  cat("=== DETAILED RULES ===\n\n")
+  
+  # Get all terminal nodes
+  terminal_nodes <- nodeids(model, terminal = TRUE)
+  
+  rules_list <- list()
+  
+  for (node_id in terminal_nodes) {
+    # Get the path to this node
+    path <- partykit:::.list.rules.party(model, node_id)
+    
+    # Get prediction for this node
+    node_info <- model[node_id]
+    prediction <- names(which.max(node_info$prediction))
+    n_obs <- node_info$n
+    
+    # Format rule
+    rule <- paste0(
+      "Rule for Node ", node_id, ":\n",
+      "  IF ", path, "\n",
+      "  THEN predict: ", prediction, "\n",
+      "  (n = ", n_obs, " observations)\n"
+    )
+    
+    rules_list[[as.character(node_id)]] <- rule
+    cat(rule, "\n")
+  }
+  
+  invisible(rules_list)
+}
+extract_rules(ctree_model)
+```
+```{r}
+print_rules_clean <- function(model) {
+  cat("=== CLEAN RULES FORMAT ===\n\n")
+  
+  # Get terminal node IDs
+  terminal_nodes <- nodeids(model, terminal = TRUE)
+  
+  for (node_id in terminal_nodes) {
+    # Get the rule path
+    rule_text <- partykit:::.list.rules.party(model, node_id)
+    
+    # Get node information
+    node_data <- data_party(model, node_id)
+    prediction <- predict(model, newdata = node_data, type = "response")[1]
+    n_obs <- nrow(node_data)
+    
+    # Print rule
+    cat("Node", node_id, ":", rule_text, "\n")
+    cat("  -> Prediction:", prediction, "(n =", n_obs, ")\n\n")
+  }
+}
+
+print_rules_clean(ctree_model)
+```
+
+
+
